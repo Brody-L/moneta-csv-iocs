@@ -9,6 +9,7 @@ OPTIONAL
 -d
 --option {from-base|statistics}
 --filter {unsigned-module|clr-prvx|clr-heap|metadata-modules}
+--ioc-csv <file path>
 --address <memory address>
 --region-size <memory region size>
 
@@ -46,3 +47,4 @@ OPTIONAL
                     clr-prvx            Managed heaps associated with active CLR heaps and JIT code.
                     wow64-init          IOCs resulting from Wow64 process initialization such as certain
                                         modified system library code sections
+--ioc-csv           Write full-fidelity IOC output to a CSV file (only valid with -m ioc).

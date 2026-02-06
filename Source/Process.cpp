@@ -40,10 +40,270 @@ ________________________________________________________________________________
 #include "Signing.h"
 #include "PEB.h"
 #include "DotNetNative.h"
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 using namespace std;
 using namespace Memory;
 using namespace Processes;
+
+namespace {
+struct IocCsvRow {
+	std::wstring ProcessName;
+	std::wstring Pid;
+	std::wstring ParentPid;
+	std::wstring Architecture;
+	std::wstring Wow64;
+	std::wstring ClrVersion;
+	std::wstring ProcessCreateTimeUtc;
+	std::wstring ScanTimeUtc;
+	std::wstring Type;
+	std::wstring State;
+	std::wstring RegionBase;
+	std::wstring RegionSize;
+	std::wstring SubregionBase;
+	std::wstring SubregionSize;
+	std::wstring Permissions;
+	std::wstring SectionName;
+	std::wstring ModulePath;
+	std::wstring IocTypes;
+	std::wstring Attributes;
+	std::wstring PrivateSize;
+};
+
+std::wstring CsvEscape(const std::wstring& value) {
+	std::wstring escaped = value;
+	size_t pos = 0;
+	while ((pos = escaped.find(L"\"", pos)) != std::wstring::npos) {
+		escaped.insert(pos, L"\"");
+		pos += 2;
+	}
+	return L"\"" + escaped + L"\"";
+}
+
+std::wstring FormatHexPointer(const void* value) {
+	if (value == nullptr) {
+		return L"";
+	}
+	std::wstringstream stream;
+	stream << L"0x" << std::uppercase << std::setfill(L'0') << std::setw(sizeof(void*) * 2)
+		<< std::hex << reinterpret_cast<uintptr_t>(value);
+	return stream.str();
+}
+
+std::wstring FormatHex32(uint32_t value) {
+	std::wstringstream stream;
+	stream << L"0x" << std::uppercase << std::setfill(L'0') << std::setw(8) << std::hex << value;
+	return stream.str();
+}
+
+std::wstring JoinWithPipe(const std::vector<std::wstring>& values) {
+	std::wstring joined;
+	for (const auto& value : values) {
+		if (!joined.empty()) {
+			joined += L"|";
+		}
+		joined += value;
+	}
+	return joined;
+}
+
+std::wstring FormatFileTimeUtc(const FILETIME& fileTime) {
+	SYSTEMTIME systemTime = { 0 };
+	if (!FileTimeToSystemTime(&fileTime, &systemTime)) {
+		return L"";
+	}
+
+	ULARGE_INTEGER uli;
+	uli.LowPart = fileTime.dwLowDateTime;
+	uli.HighPart = fileTime.dwHighDateTime;
+	uint64_t total100ns = uli.QuadPart;
+	uint64_t fractional100ns = total100ns % 10000000ULL;
+	uint64_t fractionalNs = fractional100ns * 100ULL; // FILETIME is 100ns ticks
+
+	std::wstringstream stream;
+	stream << std::setfill(L'0')
+		<< std::setw(4) << systemTime.wYear << L"-"
+		<< std::setw(2) << systemTime.wMonth << L"-"
+		<< std::setw(2) << systemTime.wDay << L"T"
+		<< std::setw(2) << systemTime.wHour << L":"
+		<< std::setw(2) << systemTime.wMinute << L":"
+		<< std::setw(2) << systemTime.wSecond << L"."
+		<< std::setw(9) << fractionalNs << L"Z";
+
+	return stream.str();
+}
+
+std::wstring GetProcessCreateTimeUtc(HANDLE processHandle) {
+	FILETIME creationTime = { 0 };
+	FILETIME exitTime = { 0 };
+	FILETIME kernelTime = { 0 };
+	FILETIME userTime = { 0 };
+	if (!GetProcessTimes(processHandle, &creationTime, &exitTime, &kernelTime, &userTime)) {
+		return L"";
+	}
+	return FormatFileTimeUtc(creationTime);
+}
+
+std::wstring GetParentPid(HANDLE processHandle) {
+	struct PROCESS_BASIC_INFORMATION_EX {
+		PVOID Reserved1;
+		PVOID PebBaseAddress;
+		PVOID Reserved2[2];
+		ULONG_PTR UniqueProcessId;
+		ULONG_PTR InheritedFromUniqueProcessId;
+	};
+
+	static NtQueryInformationProcess_t NtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcess_t>(GetProcAddress(GetModuleHandleW(L"Ntdll.dll"), "NtQueryInformationProcess"));
+	if (!NtQueryInformationProcess) {
+		return L"";
+	}
+	PROCESS_BASIC_INFORMATION_EX pbi = { 0 };
+	NTSTATUS status = NtQueryInformationProcess(processHandle, ProcessBasicInformation, &pbi, sizeof(pbi), nullptr);
+	if (!NT_SUCCESS(status)) {
+		return L"";
+	}
+	return std::to_wstring(static_cast<uint32_t>(pbi.InheritedFromUniqueProcessId));
+}
+
+std::wstring GetScanTimeUtcNow() {
+	FILETIME now = { 0 };
+	GetSystemTimeAsFileTime(&now);
+	return FormatFileTimeUtc(now);
+}
+
+std::wstring BuildAttributes(const Subregion* subregion) {
+	std::vector<std::wstring> values;
+	if ((subregion->GetFlags() & MEMORY_SUBREGION_FLAG_HEAP)) {
+		values.emplace_back(L"Heap");
+	}
+	if ((subregion->GetFlags() & MEMORY_SUBREGION_FLAG_TEB)) {
+		values.emplace_back(L"TEB");
+	}
+	if ((subregion->GetFlags() & MEMORY_SUBREGION_FLAG_STACK)) {
+		values.emplace_back(L"Stack");
+	}
+	if ((subregion->GetFlags() & MEMORY_SUBREGION_FLAG_DOTNET)) {
+		values.emplace_back(L".NET");
+	}
+	if ((subregion->GetFlags() & MEMORY_SUBREGION_FLAG_BASE_IMAGE)) {
+		values.emplace_back(L"Primary image base");
+	}
+	return JoinWithPipe(values);
+}
+
+std::wstring BuildIocList(map<uint8_t*, list<Ioc*>>* iocs, uint8_t* subregionAddress, bool entityTop) {
+	if (iocs == nullptr || !iocs->count(subregionAddress)) {
+		return L"";
+	}
+	std::vector<std::wstring> values;
+	list<Ioc*>& iocList = iocs->at(subregionAddress);
+	for (const auto* ioc : iocList) {
+		if (entityTop == ioc->IsFullEntityIoc()) {
+			values.emplace_back(ioc->GetDescription(ioc->GetType()));
+		}
+	}
+	return JoinWithPipe(values);
+}
+
+std::wstring BuildEntityTypeString(const Entity* entity) {
+	if (entity->GetType() == Entity::Type::PE_FILE) {
+		const PeVm::Body* peEntity = dynamic_cast<const PeVm::Body*>(entity);
+		std::wstring type;
+		if (peEntity->GetPeFile() != nullptr) {
+			if (peEntity->GetPeFile()->IsDotNet()) {
+				type += L".NET ";
+			}
+			if (peEntity->GetPeFile()->IsExe()) {
+				type += L"EXE ";
+			}
+			else if (peEntity->GetPeFile()->IsDll()) {
+				type += L"DLL ";
+			}
+		}
+		else {
+			type += L"Phantom ";
+		}
+
+		if (peEntity->IsNonExecutableImage()) {
+			type += L"NX-Image";
+		}
+		else {
+			type += L"Image";
+		}
+		return type;
+	}
+	if (entity->GetType() == Entity::Type::MAPPED_FILE) {
+		return L"Mapped";
+	}
+	if (entity->GetSubregions().front()->GetBasic()->Type == MEM_PRIVATE) {
+		return L"Private";
+	}
+	return L"?";
+}
+
+class IocCsvWriter {
+public:
+	bool Enable(const std::wstring& path) {
+		if (path.empty()) {
+			return false;
+		}
+		if (!Stream.is_open() || Path != path) {
+			if (Stream.is_open()) {
+				Stream.close();
+			}
+			Path = path;
+			Stream.open(Path, std::ios::out | std::ios::trunc);
+			HeaderWritten = false;
+		}
+		return Stream.is_open();
+	}
+
+	void WriteHeader() {
+		if (HeaderWritten || !Stream.is_open()) {
+			return;
+		}
+		Stream << L"ProcessName,PID,ParentPID,Architecture,Wow64,CLRVersion,ProcessCreateTimeUTC,ScanTimeUTC,Type,State,RegionBase,RegionSize,SubregionBase,SubregionSize,Permissions,SectionName,ModulePath,IOCType,Attributes,PrivateSize\r\n";
+		HeaderWritten = true;
+	}
+
+	void WriteRow(const IocCsvRow& row) {
+		if (!Stream.is_open()) {
+			return;
+		}
+		Stream
+			<< CsvEscape(row.ProcessName) << L","
+			<< CsvEscape(row.Pid) << L","
+			<< CsvEscape(row.ParentPid) << L","
+			<< CsvEscape(row.Architecture) << L","
+			<< CsvEscape(row.Wow64) << L","
+			<< CsvEscape(row.ClrVersion) << L","
+			<< CsvEscape(row.ProcessCreateTimeUtc) << L","
+			<< CsvEscape(row.ScanTimeUtc) << L","
+			<< CsvEscape(row.Type) << L","
+			<< CsvEscape(row.State) << L","
+			<< CsvEscape(row.RegionBase) << L","
+			<< CsvEscape(row.RegionSize) << L","
+			<< CsvEscape(row.SubregionBase) << L","
+			<< CsvEscape(row.SubregionSize) << L","
+			<< CsvEscape(row.Permissions) << L","
+			<< CsvEscape(row.SectionName) << L","
+			<< CsvEscape(row.ModulePath) << L","
+			<< CsvEscape(row.IocTypes) << L","
+			<< CsvEscape(row.Attributes) << L","
+			<< CsvEscape(row.PrivateSize) << L"\r\n";
+	}
+
+private:
+	std::wofstream Stream;
+	std::wstring Path;
+	bool HeaderWritten = false;
+};
+
+IocCsvWriter gIocCsvWriter;
+}
 
 Process::~Process() {
 	if (this->Handle != nullptr) {
@@ -378,6 +638,23 @@ bool Process::CheckDotNetAffiliation(const uint8_t* pReferencedAddress, const ui
 }
 
 void Process::Enumerate(ScannerContext& ScannerCtx, vector<Ioc*> *SelectedIocs, vector<Subregion*> *SelectedSbrs) {
+	bool csvEnabled = ScannerCtx.GetMst() == ScannerContext::MemorySelection_t::Ioc && ScannerCtx.HasIocCsvPath();
+	if (csvEnabled && !gIocCsvWriter.Enable(ScannerCtx.GetIocCsvPath())) {
+		Interface::Log(Interface::VerbosityLevel::Surface, "... failed to open IOC CSV output file\r\n");
+		csvEnabled = false;
+	}
+	if (csvEnabled) {
+		gIocCsvWriter.WriteHeader();
+	}
+
+	const std::wstring processName = this->Name;
+	const std::wstring pidStr = std::to_wstring(this->GetPid());
+	const std::wstring archStr = this->IsWow64() ? L"x86" : L"x64";
+	const std::wstring wow64Str = this->IsWow64() ? L"yes" : L"no";
+	const std::wstring clrStr = this->GetClrVersion() ? std::to_wstring(this->GetClrVersion()) : L"";
+	const std::wstring parentPidStr = GetParentPid(this->Handle);
+	const std::wstring processCreateTimeUtc = GetProcessCreateTimeUtc(this->Handle);
+	const std::wstring scanTimeUtc = GetScanTimeUtcNow();
 	bool bShownProc = false;
 	wstring_convert<codecvt_utf8_utf16<wchar_t>> UnicodeConverter;
 	IocMap Iocs;
@@ -505,6 +782,42 @@ void Process::Enumerate(ScannerContext& ScannerCtx, vector<Ioc*> *SelectedIocs, 
 			AppendOverlapIoc(IocSbrMap, static_cast<uint8_t*>(const_cast<void *>(Itr->second->GetStartVa())), true, SelectedIocs);
 			Interface::Log(Interface::VerbosityLevel::Surface, "\r\n");
 
+			if (csvEnabled && Itr->second->GetSubregions().front()->GetBasic()->State != MEM_FREE) {
+				IocCsvRow row;
+				row.ProcessName = processName;
+				row.Pid = pidStr;
+				row.ParentPid = parentPidStr;
+				row.Architecture = archStr;
+				row.Wow64 = wow64Str;
+				row.ClrVersion = clrStr;
+				row.ProcessCreateTimeUtc = processCreateTimeUtc;
+				row.ScanTimeUtc = scanTimeUtc;
+				row.Type = BuildEntityTypeString(Itr->second);
+				row.State = Subregion::StateSymbol(Itr->second->GetSubregions().front()->GetBasic()->State);
+				row.RegionBase = FormatHexPointer(Itr->second->GetStartVa());
+				row.RegionSize = FormatHex32(Itr->second->GetEntitySize());
+				row.SubregionBase = L"";
+				row.SubregionSize = L"";
+				row.Permissions = L"";
+				row.SectionName = L"";
+				row.ModulePath = L"";
+				row.IocTypes = BuildIocList(IocSbrMap, static_cast<uint8_t*>(const_cast<void*>(Itr->second->GetStartVa())), true);
+				row.Attributes = L"";
+				row.PrivateSize = L"";
+
+				if (Itr->second->GetType() == Entity::Type::PE_FILE) {
+					const PeVm::Body* peEntity = dynamic_cast<const PeVm::Body*>(Itr->second);
+					if (!peEntity->GetFileBase()->IsPhantom()) {
+						row.ModulePath = peEntity->GetFileBase()->GetPath();
+					}
+				}
+				else if (Itr->second->GetType() == Entity::Type::MAPPED_FILE) {
+					row.ModulePath = dynamic_cast<MappedFile*>(Itr->second)->GetFileBase()->GetPath();
+				}
+
+				gIocCsvWriter.WriteRow(row);
+			}
+
 			if (Interface::GetVerbosity() == Interface::VerbosityLevel::Detail) {
 				if (Itr->second->GetType() == Entity::Type::PE_FILE) {
 					PeVm::Body* PeEntity = dynamic_cast<PeVm::Body*>(Itr->second);
@@ -574,6 +887,34 @@ void Process::Enumerate(ScannerContext& ScannerCtx, vector<Ioc*> *SelectedIocs, 
 							AppendSubregionAttributes(*SbrItr);
 							AppendOverlapIoc(IocSbrMap, static_cast<uint8_t *>((*SbrItr)->GetBasic()->BaseAddress), false, SelectedIocs);
 							Interface::Log(Interface::VerbosityLevel::Surface, "\r\n");
+
+							if (csvEnabled) {
+								IocCsvRow row;
+								row.ProcessName = processName;
+								row.Pid = pidStr;
+								row.ParentPid = parentPidStr;
+								row.Architecture = archStr;
+								row.Wow64 = wow64Str;
+								row.ClrVersion = clrStr;
+								row.ProcessCreateTimeUtc = processCreateTimeUtc;
+								row.ScanTimeUtc = scanTimeUtc;
+								row.Type = BuildEntityTypeString(Itr->second);
+								row.State = Subregion::StateSymbol((*SbrItr)->GetBasic()->State);
+								row.RegionBase = FormatHexPointer(Itr->second->GetStartVa());
+								row.RegionSize = FormatHex32(Itr->second->GetEntitySize());
+								row.SubregionBase = FormatHexPointer((*SbrItr)->GetBasic()->BaseAddress);
+								row.SubregionSize = FormatHex32((*SbrItr)->GetBasic()->RegionSize);
+								row.Permissions = Subregion::AttribDesc((*SbrItr)->GetBasic());
+								row.SectionName = L"?";
+								if (!dynamic_cast<PeVm::Body*>(Itr->second)->GetFileBase()->IsPhantom()) {
+									row.ModulePath = dynamic_cast<PeVm::Body*>(Itr->second)->GetFileBase()->GetPath();
+								}
+								row.IocTypes = BuildIocList(IocSbrMap, static_cast<uint8_t*>((*SbrItr)->GetBasic()->BaseAddress), false);
+								row.Attributes = BuildAttributes(*SbrItr);
+								row.PrivateSize = FormatHex32((*SbrItr)->GetPrivateSize());
+
+								gIocCsvWriter.WriteRow(row);
+							}
 						}
 						else{
 							for (vector<PeVm::Section*>::const_iterator SectItr = OverlapSections.begin(); SectItr != OverlapSections.end(); ++SectItr) {
@@ -589,6 +930,34 @@ void Process::Enumerate(ScannerContext& ScannerCtx, vector<Ioc*> *SelectedIocs, 
 								AppendOverlapIoc(IocSbrMap, static_cast<uint8_t *>((*SbrItr)->GetBasic()->BaseAddress), false, SelectedIocs);
 								Interface::Log(Interface::VerbosityLevel::Surface, "\r\n");
 
+								if (csvEnabled) {
+									IocCsvRow row;
+									row.ProcessName = processName;
+									row.Pid = pidStr;
+									row.ParentPid = parentPidStr;
+									row.Architecture = archStr;
+									row.Wow64 = wow64Str;
+									row.ClrVersion = clrStr;
+									row.ProcessCreateTimeUtc = processCreateTimeUtc;
+									row.ScanTimeUtc = scanTimeUtc;
+									row.Type = BuildEntityTypeString(Itr->second);
+									row.State = Subregion::StateSymbol((*SbrItr)->GetBasic()->State);
+									row.RegionBase = FormatHexPointer(Itr->second->GetStartVa());
+									row.RegionSize = FormatHex32(Itr->second->GetEntitySize());
+									row.SubregionBase = FormatHexPointer((*SbrItr)->GetBasic()->BaseAddress);
+									row.SubregionSize = FormatHex32((*SbrItr)->GetBasic()->RegionSize);
+									row.Permissions = Subregion::AttribDesc((*SbrItr)->GetBasic());
+									row.SectionName = UnicodeSectName;
+									if (!dynamic_cast<PeVm::Body*>(Itr->second)->GetFileBase()->IsPhantom()) {
+										row.ModulePath = dynamic_cast<PeVm::Body*>(Itr->second)->GetFileBase()->GetPath();
+									}
+									row.IocTypes = BuildIocList(IocSbrMap, static_cast<uint8_t*>((*SbrItr)->GetBasic()->BaseAddress), false);
+									row.Attributes = BuildAttributes(*SbrItr);
+									row.PrivateSize = FormatHex32((*SbrItr)->GetPrivateSize());
+
+									gIocCsvWriter.WriteRow(row);
+								}
+
 							}
 						}
 					}
@@ -597,6 +966,36 @@ void Process::Enumerate(ScannerContext& ScannerCtx, vector<Ioc*> *SelectedIocs, 
 						AppendSubregionAttributes(*SbrItr);
 						AppendOverlapIoc(IocSbrMap, static_cast<uint8_t *>((*SbrItr)->GetBasic()->BaseAddress), false, SelectedIocs);
 						Interface::Log(Interface::VerbosityLevel::Surface, "\r\n");
+
+						if (csvEnabled) {
+							IocCsvRow row;
+							row.ProcessName = processName;
+							row.Pid = pidStr;
+							row.ParentPid = parentPidStr;
+							row.Architecture = archStr;
+							row.Wow64 = wow64Str;
+							row.ClrVersion = clrStr;
+							row.ProcessCreateTimeUtc = processCreateTimeUtc;
+							row.ScanTimeUtc = scanTimeUtc;
+							row.Type = BuildEntityTypeString(Itr->second);
+							row.State = Subregion::StateSymbol((*SbrItr)->GetBasic()->State);
+							row.RegionBase = FormatHexPointer(Itr->second->GetStartVa());
+							row.RegionSize = FormatHex32(Itr->second->GetEntitySize());
+							row.SubregionBase = FormatHexPointer((*SbrItr)->GetBasic()->BaseAddress);
+							row.SubregionSize = FormatHex32((*SbrItr)->GetBasic()->RegionSize);
+							row.Permissions = Subregion::AttribDesc((*SbrItr)->GetBasic());
+							row.SectionName = L"";
+							row.ModulePath = L"";
+							row.IocTypes = BuildIocList(IocSbrMap, static_cast<uint8_t*>((*SbrItr)->GetBasic()->BaseAddress), false);
+							row.Attributes = BuildAttributes(*SbrItr);
+							row.PrivateSize = FormatHex32((*SbrItr)->GetPrivateSize());
+
+							if (Itr->second->GetType() == Entity::Type::MAPPED_FILE) {
+								row.ModulePath = dynamic_cast<MappedFile*>(Itr->second)->GetFileBase()->GetPath();
+							}
+
+							gIocCsvWriter.WriteRow(row);
+						}
 					}
 
 					if (Interface::GetVerbosity() == Interface::VerbosityLevel::Detail) {

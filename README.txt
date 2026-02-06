@@ -84,3 +84,12 @@ Enumerate surface level information related to suspicious memory in all processe
 stemming from unsigned modules and metadata modules:
 
     Moneta64.exe -m ioc -p * --filter unsigned-modules metadata-modules
+
+CSV IOC Output (Fork Extension)
+
+This fork of Moneta adds optional CSV output for Indicators of Compromise (IOCs),
+intended for Timeline Explorer, Excel, and PowerQuery workflows.
+
+Usage
+
+Moneta64.exe -m ioc -p * --ioc-csv findings.csv

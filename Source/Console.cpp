@@ -61,6 +61,7 @@ int32_t wmain(int32_t nArgc, const wchar_t* pArgv[]) {
 	uint8_t* pAddress = nullptr;
 	bool bSuppressBanner = false;
 	uint64_t qwOptFlags = 0, qwFilterFlags = 0;
+	wstring IocCsvPath;
 
 	for (vector<wstring>::const_iterator i = Args.begin(); i != Args.end(); ++i) {
 		wstring Arg = *i;
@@ -97,6 +98,9 @@ int32_t wmain(int32_t nArgc, const wchar_t* pArgv[]) {
 		}
 		else if (Arg == L"--region-size") {
 			dwRegionSize = _wtoi((*(i + 1)).c_str());
+		}
+		else if (Arg == L"--ioc-csv") {
+			IocCsvPath = *(i + 1);
 		}
 		else if (Arg == L"--option") {
 			for (vector<wstring>::const_iterator OptZtr = i; OptZtr != Args.end(); ++OptZtr) {
@@ -206,6 +210,11 @@ int32_t wmain(int32_t nArgc, const wchar_t* pArgv[]) {
 			return 0;
 		}
 
+		if (!IocCsvPath.empty() && Mst != ScannerContext::MemorySelection_t::Ioc) {
+			Interface::Log(Interface::VerbosityLevel::Surface, "... IOC CSV output is only supported with -m ioc\r\n");
+			return 0;
+		}
+
 		if ((Mst == ScannerContext::MemorySelection_t::Referenced || Mst == ScannerContext::MemorySelection_t::Block) && pAddress == nullptr) {
 			Interface::Log(Interface::VerbosityLevel::Surface, "... address must be specified for the provided memory selection type.\r\n");
 			return 0;
@@ -226,7 +235,7 @@ int32_t wmain(int32_t nArgc, const wchar_t* pArgv[]) {
 
 		// Analyze processes and generate memory maps/suspicions
 
-		ScannerContext ScannerCtx(qwOptFlags, Mst, pAddress, dwRegionSize, qwFilterFlags);
+		ScannerContext ScannerCtx(qwOptFlags, Mst, pAddress, dwRegionSize, qwFilterFlags, IocCsvPath);
 		uint64_t qwStartTick = GetTickCount64();
 
 		if (ProcType == SelectedProcess_t::SelfPid || ProcType == SelectedProcess_t::SpecificPid) {

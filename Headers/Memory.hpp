@@ -59,13 +59,13 @@ namespace Memory {
 		void SetSubregions(std::vector<Subregion*>);
 		bool IsPartiallyExecutable() const;
 		virtual ~Entity();
-		virtual Entity::Type GetType() = 0;
+		virtual Entity::Type GetType() const = 0;
 	};
 
 	class Region : public Entity { // This is essential, since a parameterized constructor of the base entity class is impossible (since it is an abstract base class with a deferred method). new Entity() is impossible for this reason: only derived classes can be initialized.
 	public:
 		Region(HANDLE hProcess, std::vector<Subregion*> Subregions);
-		Entity::Type GetType() { return Entity::Type::UNKNOWN; }
+		Entity::Type GetType() const { return Entity::Type::UNKNOWN; }
 	};
 
 	class MappedFile : virtual public Region { // Virtual inheritance from entity prevents classes derived from entity from having ambiguous/conflicting content.
@@ -73,7 +73,7 @@ namespace Memory {
 		FileBase* MapFileBase;
 	public:
 		MappedFile(HANDLE hProcess, std::vector<Subregion*> Subregions, const wchar_t* FilePath, bool bMemStore = false);
-		Entity::Type GetType() { return Entity::Type::MAPPED_FILE; }
+		Entity::Type GetType() const { return Entity::Type::MAPPED_FILE; }
 		FileBase* GetFileBase() const { return this->MapFileBase; }
 		virtual ~MappedFile();
 	};
@@ -115,7 +115,7 @@ namespace Memory {
 				bool Missing;
 			} PebMod;
 		public:
-			Entity::Type GetType() { return Entity::Type::PE_FILE; }
+			Entity::Type GetType() const { return Entity::Type::PE_FILE; }
 			::PeFile* GetPeFile() const { return this->FilePe.get(); }
 			bool IsSigned() const;
 			Signing_t GetSisningType() const;
@@ -135,7 +135,7 @@ namespace Memory {
 		public:
 			Section(HANDLE hProcess, std::vector<Subregion*> Subregions, IMAGE_SECTION_HEADER* SectHdr, uint8_t* pPeBuf);
 			const IMAGE_SECTION_HEADER* GetHeader() { return &this->Hdr; }
-			Entity::Type GetType() { return Entity::Type::PE_SECTION; }
+			Entity::Type GetType() const { return Entity::Type::PE_SECTION; }
 		protected:
 			IMAGE_SECTION_HEADER Hdr;
 		};
